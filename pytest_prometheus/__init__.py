@@ -41,13 +41,18 @@ class PrometheusReport:
         self.prefix = config.getoption('prometheus_metric_prefix')
         self.pushgateway_url = config.getoption('prometheus_pushgateway_url')
         self.job_name = config.getoption('prometheus_job_name')
+
+        # Initialize extra_labels first
+        extra_labels_raw = config.getoption('prometheus_extra_label') or []
+        self.extra_labels = {item[0]: item[1] for item in [i.split('=', 1) for i in extra_labels_raw]}
+
+        # Then initialize registry and metrics
         self.registry = CollectorRegistry()
 
         self.passed = []
         self.failed = []
         self.skipped = []
-
-        self.extra_labels = {item[0]: item[1] for item in [i.split('=', 1) for i in config.getoption('prometheus_extra_label')]}
+        self.total_tests = []
 
     def _make_metric_name(self, name):
         unsanitized_name = '{prefix}{name}'.format(
@@ -82,6 +87,9 @@ class PrometheusReport:
             funcname = report.location[2]
             name = self._make_metric_name(funcname)
 
+            # Add total count regardless of outcome
+            self.total_tests.append(name)
+
             if report.outcome == 'passed':
                 self.passed.append(name)
             elif report.outcome == 'skipped':
@@ -92,6 +100,12 @@ class PrometheusReport:
 
 
     def pytest_sessionfinish(self, session):
+
+        total_metric = Gauge(self._make_metric_name("total"),
+                             "Total number of tests executed",
+                             labelnames=self._get_label_names(),
+                             registry=self.registry)
+        self.add_metrics_for_tests(total_metric, self.total_tests)
 
         passed_metric = Gauge(self._make_metric_name("passed"),
                 "Number of passed tests",
