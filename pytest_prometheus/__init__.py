@@ -42,91 +42,115 @@ class PrometheusReport:
         self.pushgateway_url = config.getoption('prometheus_pushgateway_url')
         self.job_name = config.getoption('prometheus_job_name')
 
-        # Initialize extra_labels first
+        # Initialize extra_labels
         extra_labels_raw = config.getoption('prometheus_extra_label') or []
-        self.extra_labels = {item[0]: item[1] for item in [i.split('=', 1) for i in extra_labels_raw]}
+        self.extra_labels = {}
+        for label in extra_labels_raw:
+            try:
+                key, value = label.split('=', 1)
+                self.extra_labels[key] = value
+            except ValueError:
+                logging.warning(f"Skipping invalid label format: {label}")
 
-        # Then initialize registry and metrics
+        # Initialize registry
         self.registry = CollectorRegistry()
 
-        self.passed = []
-        self.failed = []
-        self.skipped = []
-        self.total_tests = []
+        # Initialize counters
+        self.test_results = {}  # Store test results by name and outcome
 
     def _make_metric_name(self, name):
-        unsanitized_name = '{prefix}{name}'.format(
-                prefix=self.prefix,
-                name=name
-        )
-        # Valid names can only contain these characters, replace all others with _
-        # https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels
+        unsanitized_name = f'{self.prefix}{name}'
         pattern = r'[^a-zA-Z0-9_]'
         replacement = '_'
         return re.sub(pattern, replacement, unsanitized_name)
 
     def _make_labels(self, testname):
-        ret = self.extra_labels.copy()
-        ret["testname"] = testname
-        return ret
+        labels = self.extra_labels.copy()
+        labels["testname"] = testname
+        return labels
 
     def _get_label_names(self):
-        return self._make_labels("").keys()
-
-    def add_metrics_for_tests(self, metric, testnames):
-        for testname in testnames:
-            labels = self._make_labels(testname)
-            metric.labels(**labels).inc()
-
+        return list(self._make_labels("").keys())
 
     def pytest_runtest_logreport(self, report):
-        # https://docs.pytest.org/en/latest/reference.html#_pytest.runner.TestReport.when
-        # 'call' is the phase when the test is being ran
-        if report.when == 'call':
+        try:
+            if not hasattr(report, 'location'):
+                return
 
             funcname = report.location[2]
             name = self._make_metric_name(funcname)
 
-            # Add total count regardless of outcome
-            self.total_tests.append(name)
+            if not name in self.test_results:
+                self.test_results[name] = {'status': None, 'phase': None}
 
-            if report.outcome == 'passed':
-                self.passed.append(name)
-            elif report.outcome == 'skipped':
-                self.skipped.append(name)
-            elif report.outcome == 'failed':
-                self.failed.append(name)
+            # Skip if we've already recorded a final status for this test
+            current_status = self.test_results[name]['status']
+            if current_status in ('failed', 'passed'):
+                return
 
+            # Record the test outcome
+            if report.when == 'call':
+                if report.outcome == 'passed':
+                    self.test_results[name]['status'] = 'passed'
+                elif report.outcome == 'failed':
+                    self.test_results[name]['status'] = 'failed'
+            elif report.when == 'setup':
+                if report.outcome == 'skipped':
+                    self.test_results[name]['status'] = 'skipped'
+                elif report.outcome == 'failed':
+                    self.test_results[name]['status'] = 'failed'
 
+        except Exception as e:
+            logging.error(f"Error processing test report: {e}")
 
     def pytest_sessionfinish(self, session):
+        try:
+            # Prepare metric data
+            passed = []
+            failed = []
+            skipped = []
+            total = list(self.test_results.keys())
 
-        total_metric = Gauge(self._make_metric_name("total"),
-                             "Total number of tests executed",
-                             labelnames=self._get_label_names(),
-                             registry=self.registry)
-        self.add_metrics_for_tests(total_metric, self.total_tests)
+            # Categorize tests based on their final status
+            for name, result in self.test_results.items():
+                status = result['status']
+                if status == 'passed':
+                    passed.append(name)
+                elif status == 'failed':
+                    failed.append(name)
+                elif status == 'skipped':
+                    skipped.append(name)
 
-        passed_metric = Gauge(self._make_metric_name("passed"),
-                "Number of passed tests",
-                labelnames=self._get_label_names(),
-                registry=self.registry)
-        self.add_metrics_for_tests(passed_metric, self.passed)
+            # Create and populate metrics
+            label_names = self._get_label_names()
 
+            metrics = [
+                ('total', total, "Total number of tests executed"),
+                ('passed', passed, "Number of passed tests"),
+                ('failed', failed, "Number of failed tests"),
+                ('skipped', skipped, "Number of skipped tests")
+            ]
 
-        failed_metric = Gauge(self._make_metric_name("failed"),
-                "Number of failed tests",
-                labelnames=self._get_label_names(),
-                registry=self.registry)
-        self.add_metrics_for_tests(failed_metric, self.failed)
+            for metric_name, test_list, description in metrics:
+                gauge = Gauge(
+                    self._make_metric_name(metric_name),
+                    description,
+                    labelnames=label_names,
+                    registry=self.registry
+                )
 
-        skipped_metric = Gauge(self._make_metric_name("skipped"),
-                "Number of skipped tests",
-                labelnames=self._get_label_names(),
-                registry=self.registry)
-        self.add_metrics_for_tests(skipped_metric, self.skipped)
+                for test in test_list:
+                    try:
+                        labels = self._make_labels(test)
+                        gauge.labels(**labels).inc()
+                    except Exception as e:
+                        logging.error(f"Error incrementing metric for test {test}: {e}")
 
-        push_to_gateway(self.pushgateway_url, registry=self.registry, job=self.job_name)
+            # Push metrics to gateway
+            push_to_gateway(self.pushgateway_url, registry=self.registry, job=self.job_name)
+
+        except Exception as e:
+            logging.error(f"Error in session finish: {e}")
 
     def pytest_terminal_summary(self, terminalreporter):
         # Write to the pytest terminal
